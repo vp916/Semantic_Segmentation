@@ -2,31 +2,35 @@
 
 A deep learning project for **multi-class semantic segmentation of mechanical components** in cluttered industrial images.
 
-The objective is to predict the class of **every pixel** in a \(384\times384\) RGB image containing multiple overlapping mechanical parts.
+The goal is to predict the class of every pixel in a 384 × 384 RGB image containing multiple mechanical parts, including overlapping and visually similar objects.
 
-The project focuses on building the complete segmentation pipeline:
+The final solution achieved a **private leaderboard Dice score of 0.97960**.
 
-\[
-\text{Image}
-\rightarrow
-\text{Augmentation}
-\rightarrow
-\text{U-Net++}
-\rightarrow
-\text{Pixel-wise logits}
-\rightarrow
-\text{Class prediction}
-\rightarrow
-\text{RLE submission}
-\]
+---
 
-The implementation uses **PyTorch**, **Segmentation Models PyTorch**, and **Albumentations**, with all model weights initialized from scratch.
+## Overview
+
+This project implements an end-to-end semantic segmentation pipeline using:
+
+- **PyTorch**
+- **Segmentation Models PyTorch**
+- **Albumentations**
+- **U-Net++**
+- **ResNet-34**
+- **EfficientNet-B1**
+- **AdamW**
+- **Cosine Annealing**
+- **Mixed Precision Training**
+- **Test-Time Augmentation (TTA)**
+- **Model Ensembling**
+
+All model weights were initialized from scratch. No pretrained encoder weights were used.
 
 ---
 
 ## 1. Problem
 
-This is a **7-class semantic segmentation** problem:
+The task is a 7-class semantic segmentation problem:
 
 | ID | Class |
 |---:|---|
@@ -38,9 +42,34 @@ This is a **7-class semantic segmentation** problem:
 | 5 | `spring` |
 | 6 | `o_ring` |
 
-Each image contains instances of the six foreground classes.
+For an input image:
 
-The challenge is not simply recognizing the objects. The model must determine their **exact spatial extent at pixel level**, including thin boundaries, holes, overlapping parts, and visually similar circular structures.
+```text
+384 × 384 × 3
+```
+
+the model produces:
+
+```text
+384 × 384 × 7
+```
+
+logits.
+
+For each pixel, the class with the highest predicted probability is selected as the final segmentation label.
+
+### Object characteristics
+
+The classes have substantially different geometric structures:
+
+- **Hex nut** — six-sided outer boundary with a central hole
+- **Washer** — thin circular ring with a central hole
+- **Bolt** — hexagonal head with a threaded shank
+- **Ball bearing** — solid spherical component
+- **Spring** — thin helical structure with repeating loops
+- **O-ring** — circular component with a rounded tube-like cross-section
+
+This makes the problem challenging because the model must simultaneously handle thin structures, holes, boundaries, different object scales, and overlapping components.
 
 ---
 
@@ -48,229 +77,273 @@ The challenge is not simply recognizing the objects. The model must determine th
 
 The dataset contains:
 
-- **2,000 labelled training images**
-- **500 unlabelled test images**
-- Image resolution: **384 × 384**
-- Image format: **RGB PNG**
-- Six foreground classes + background
+| Split | Images | Resolution |
+|---|---:|---|
+| Training | 2,000 | 384 × 384 |
+| Test | 500 | 384 × 384 |
 
-The segmentation masks contain integer class IDs directly:
+The training masks store the class IDs directly as integer pixel values from 0 to 6.
+
+The masks are loaded as:
 
 ```python
 mask = np.array(Image.open(mask_path))
 ```
 
-The masks must not be converted to RGB because the stored pixel values themselves represent the segmentation labels.
+They should **not** be converted to RGB, because the underlying pixel values represent the actual segmentation labels.
 
 ---
 
-## 3. Why This Is Difficult
-
-The six object categories have substantially different geometric structures.
-
-### Hex nut
-
-A polygonal outer boundary with a central hole.
-
-### Washer
-
-A thin circular ring with a central hole.
-
-### Bolt
-
-A hexagonal head connected to an elongated threaded shank.
-
-### Ball bearing
-
-A compact approximately spherical object with characteristic highlights.
-
-### Spring
-
-A thin helical structure containing repeated loops.
-
-### O-ring
-
-A circular object with a rounded tube-like cross-section.
-
-This creates several segmentation challenges:
-
-- small foreground regions;
-- thin structures;
-- holes inside objects;
-- similar circular shapes;
-- partial occlusion;
-- objects touching or overlapping;
-- large differences in object geometry.
-
----
-
-# 4. Evaluation Metric
+## 3. Evaluation Metric
 
 The primary metric is the **Dice coefficient**.
 
-For a predicted binary mask \(X\) and ground-truth mask \(Y\):
+For a predicted binary mask and ground-truth mask:
 
-\[
-Dice(X,Y)
-=
-\frac{2|X\cap Y|}
-{|X|+|Y|}
-\]
+```text
+Dice = 2 × |Prediction ∩ Ground Truth|
+       --------------------------------
+       |Prediction| + |Ground Truth|
+```
 
-The score ranges from:
+The value ranges from 0 to 1:
 
-\[
-0 \leq Dice \leq 1
-\]
+```text
+0 → no overlap
+1 → perfect overlap
+```
 
-where \(1\) represents perfect overlap.
+The final metric is the mean Dice across every image and foreground class.
 
-The final metric is the mean Dice across every image–class pair:
+For 500 test images and 6 foreground classes, this produces:
 
-\[
-Score =
-\frac{1}{6N}
-\sum_{i=1}^{N}
-\sum_{c=1}^{6}
-Dice(X_{i,c},Y_{i,c})
-\]
+```text
+500 × 6 = 3,000 image-class evaluations
+```
 
-This makes region overlap much more important than simple pixel accuracy.
+Dice is particularly appropriate for this problem because it directly measures segmentation overlap rather than relying only on overall pixel accuracy.
 
 ---
 
-# 5. Model Architecture
+## 4. Model Architecture
 
-## U-Net++
+### U-Net++
 
 The main segmentation architecture is **U-Net++**.
 
-Two encoder configurations were experimentally trained:
+Two encoder configurations were investigated:
 
 ```text
 U-Net++ + ResNet-34
 U-Net++ + EfficientNet-B1
 ```
 
-Both models were trained with:
+The model was created with:
+
+```python
+smp.UnetPlusPlus(
+    encoder_name=encoder_name,
+    encoder_weights=None,
+    in_channels=3,
+    classes=7
+)
+```
+
+The important point is:
 
 ```python
 encoder_weights=None
 ```
 
-so no pretrained encoder weights were used.
+Both encoders were trained from scratch.
 
-The final segmentation head predicts:
-
-\[
-7
-\]
-
-classes for every pixel.
-
-### High-level architecture
+### Architecture flow
 
 ```text
-                 Input Image
-                384 × 384 × 3
-                       │
-                       ▼
-              ┌─────────────────┐
-              │     Encoder     │
-              │ ResNet-34 /     │
-              │ EfficientNet-B1 │
-              └────────┬────────┘
-                       │
-                Multi-scale
-                  features
-                       │
-                       ▼
-              ┌─────────────────┐
-              │     U-Net++     │
-              │     Decoder     │
-              │                 │
-              │ Nested Skip     │
-              │ Connections     │
-              └────────┬────────┘
-                       │
-                       ▼
-                7-channel logits
-                       │
-                       ▼
-              Per-pixel argmax
-                       │
-                       ▼
-               Segmentation Mask
+Input Image
+     │
+     ▼
+Encoder
+     │
+     ├── Multi-scale feature extraction
+     │
+     ▼
+U-Net++ Decoder
+     │
+     ├── Nested skip connections
+     ├── Feature fusion
+     └── Spatial reconstruction
+     │
+     ▼
+7-channel segmentation head
+     │
+     ▼
+Pixel-wise class prediction
+```
+
+### Why U-Net++?
+
+Segmentation requires both semantic and spatial information.
+
+The encoder learns increasingly abstract representations:
+
+```text
+edges → textures → shapes → object-level features
+```
+
+while the decoder reconstructs spatial detail.
+
+The nested skip connections in U-Net++ allow information from different resolutions to be repeatedly combined, which is useful for objects with:
+
+- thin boundaries;
+- holes;
+- small structures;
+- elongated shapes;
+- overlapping regions.
+
+---
+
+## 5. Training Configuration
+
+| Parameter | Value |
+|---|---:|
+| Image size | 384 × 384 |
+| Batch size | 8 |
+| Maximum epochs | 100 |
+| Early stopping patience | 15 |
+| Initial learning rate | 0.001 |
+| Optimizer | AdamW |
+| Weight decay | 0.0001 |
+| Scheduler | Cosine Annealing |
+| Random seed | 42 |
+| Precision | Automatic Mixed Precision |
+
+The labelled data was split into:
+
+```text
+85% training
+15% validation
+```
+
+using a fixed random seed.
+
+---
+
+## 6. Data Augmentation
+
+The training pipeline applies both geometric and appearance-based augmentation.
+
+### Geometric augmentation
+
+```python
+HorizontalFlip
+VerticalFlip
+RandomRotate90
+ShiftScaleRotate
+```
+
+The `ShiftScaleRotate` transformation introduces variation in:
+
+- position;
+- scale;
+- rotation.
+
+### Appearance augmentation
+
+```python
+RandomBrightnessContrast
+HueSaturationValue
+```
+
+These reduce dependence on a specific lighting or colour configuration.
+
+### Noise and blur
+
+One of the following may also be applied:
+
+```python
+MotionBlur
+GaussianNoise
+```
+
+### Coarse dropout
+
+Random rectangular regions can be removed using `CoarseDropout`.
+
+This encourages the network to use surrounding context rather than relying on a single small visual feature.
+
+Validation data receives only normalization and tensor conversion.
+
+---
+
+## 7. Normalization
+
+Images are normalized using:
+
+```text
+Mean = (0.485, 0.456, 0.406)
+Std  = (0.229, 0.224, 0.225)
+```
+
+For each channel, normalization follows the standard transformation:
+
+```text
+normalized_value = (pixel_value - mean) / std
 ```
 
 ---
 
-# 6. Why U-Net++?
+## 8. Loss Function
 
-Semantic segmentation requires both:
+The final training objective combines Dice loss and Cross Entropy:
 
-1. **semantic information** — what object is present?
-2. **spatial information** — exactly which pixels belong to it?
+```text
+Loss = 0.5 × Dice Loss + 0.5 × Cross Entropy
+```
 
-The encoder progressively learns increasingly abstract representations:
+### Dice Loss
 
-\[
-\text{edges}
-\rightarrow
-\text{textures}
-\rightarrow
-\text{parts}
-\rightarrow
-\text{object structure}
-\]
+Dice loss encourages the predicted regions to overlap with the ground-truth regions.
 
-while the decoder reconstructs the spatial resolution required for pixel-level prediction.
+Conceptually:
 
-U-Net++ extends the standard encoder-decoder idea with **nested skip connections**, allowing features from different resolutions to be repeatedly fused.
+```text
+Dice Loss ≈ 1 - Dice
+```
 
-This is particularly useful for this dataset because objects contain:
+### Cross Entropy
 
-- thin structures;
-- sharp boundaries;
-- holes;
-- elongated components;
-- small foreground regions.
+Cross entropy encourages the model to assign high probability to the correct class for each pixel.
 
----
+For a pixel with ground-truth class `y`:
 
-# 7. Training Configuration
+```text
+Cross Entropy = -log(P(correct class))
+```
 
-The main configuration used in the experiments was:
+### Why combine them?
 
-| Parameter | Value |
-|---|---:|
-| Image size | \(384\times384\) |
-| Batch size | 8 |
-| Epochs | 100 |
-| Early stopping patience | 15 |
-| Initial learning rate | \(1\times10^{-3}\) |
-| Optimizer | AdamW |
-| Weight decay | \(1\times10^{-4}\) |
-| LR scheduler | Cosine Annealing |
-| Random seed | 42 |
-| Precision | Automatic mixed precision |
-| Device | CUDA when available |
+The two objectives complement each other:
 
-The training/validation split uses:
+```text
+Cross Entropy
+     ↓
+Pixel-level class discrimination
 
-\[
-85\% / 15\%
-\]
+Dice Loss
+     ↓
+Region-level overlap
 
-of the labelled images.
+        ↓
 
-A fixed random seed of `42` is used for reproducibility.
+Combined segmentation objective
+```
 
 ---
 
-# 8. Weight Initialization
+## 9. Weight Initialization
 
-Because pretrained weights were not used, the convolutional and linear layers are explicitly initialized using **Kaiming Normal initialization**:
+Because pretrained weights were not used, convolutional and linear layers were initialized using Kaiming Normal initialization.
 
 ```python
 nn.init.kaiming_normal_(
@@ -280,189 +353,51 @@ nn.init.kaiming_normal_(
 )
 ```
 
-The intuition behind Kaiming initialization is to choose the initial weight variance so that activations remain numerically stable through ReLU-based networks.
+For ReLU networks, Kaiming initialization is designed to keep activation magnitudes stable during the forward pass.
 
-For a layer with \(n\) input connections, the initialization is approximately based on:
+The approximate variance relationship is:
 
-\[
-Var(W) \approx \frac{2}{n}
-\]
+```text
+Var(W) ≈ 2 / fan_in
+```
 
-This helps avoid excessively large or vanishing activations at the beginning of training.
+This provides a suitable starting point for training deep ReLU-based networks from random initialization.
 
 ---
 
-# 9. Data Augmentation
+## 10. Optimization
 
-The training pipeline applies geometric and photometric augmentation.
+The models were trained using **AdamW**.
 
-### Geometric transformations
-
-```text
-HorizontalFlip
-VerticalFlip
-RandomRotate90
-ShiftScaleRotate
-```
-
-The `ShiftScaleRotate` operation allows the model to see variations in:
-
-- translation;
-- scale;
-- rotation.
-
-### Appearance transformations
+At a high level, gradient-based learning updates the parameters according to:
 
 ```text
-RandomBrightnessContrast
-HueSaturationValue
+parameters ← parameters - learning_rate × gradient
 ```
 
-These make the model less dependent on a specific illumination or colour configuration.
+The gradient indicates how changing each parameter would affect the loss.
 
-### Noise / blur
+AdamW additionally uses decoupled weight decay, which helps regularize the model.
 
-One of:
+### Learning-rate schedule
+
+A cosine annealing schedule was used.
+
+The learning rate gradually decreases during training, allowing:
 
 ```text
-MotionBlur
-GaussianNoise
+Early training
+→ larger parameter updates
+
+Later training
+→ smaller parameter updates
 ```
 
-may be applied.
-
-### Coarse dropout
-
-Random regions can also be removed:
-
-```text
-1–8 holes
-8–32 px height
-8–32 px width
-```
-
-This encourages the network to use broader contextual information instead of depending on a small local feature.
+This was particularly visible in the later epochs where the learning rate approached zero and the validation Dice became almost completely stable.
 
 ---
 
-# 10. Normalization
-
-Images are normalized using:
-
-\[
-\mu=(0.485,0.456,0.406)
-\]
-
-\[
-\sigma=(0.229,0.224,0.225)
-\]
-
-so each channel is transformed approximately as:
-
-\[
-x' = \frac{x-\mu}{\sigma}
-\]
-
-The validation pipeline uses normalization but does not apply random augmentation.
-
----
-
-# 11. Loss Function
-
-The final training loss is a 50/50 combination of multiclass Dice loss and cross-entropy:
-
-\[
-\mathcal{L}
-=
-0.5\mathcal{L}_{Dice}
-+
-0.5\mathcal{L}_{CE}
-\]
-
-### Dice loss
-
-Dice loss directly encourages overlap between predicted and target segmentation regions.
-
-Conceptually:
-
-\[
-\mathcal{L}_{Dice}
-\approx
-1-Dice
-\]
-
-### Cross-entropy
-
-For a pixel whose ground-truth class is \(y\), cross-entropy penalizes low probability assigned to the correct class:
-
-\[
-\mathcal{L}_{CE}
-=
--\log P(y\mid x)
-\]
-
-### Why combine them?
-
-The two losses emphasize different properties.
-
-```text
-Cross Entropy
-     ↓
-Better class discrimination
-     +
-Dice Loss
-     ↓
-Better region overlap
-     =
-Combined segmentation objective
-```
-
-This is especially useful when foreground regions occupy relatively small portions of the image.
-
----
-
-# 12. Optimization
-
-AdamW is used for parameter updates.
-
-At a high level, gradient-based optimization follows:
-
-\[
-\theta_{t+1}
-=
-\theta_t
--
-\eta_t
-\nabla_\theta\mathcal{L}
-\]
-
-where:
-
-- \(\theta\) = model parameters
-- \(\eta_t\) = learning rate
-- \(\mathcal{L}\) = segmentation loss
-
-AdamW additionally applies decoupled weight decay.
-
-The learning rate follows a cosine annealing schedule:
-
-\[
-\eta_t
-\approx
-\eta_{\min}
-+
-\frac{1}{2}
-(\eta_{\max}-\eta_{\min})
-\left(
-1+\cos\frac{\pi t}{T}
-\right)
-\]
-
-This provides relatively large updates early in training and increasingly smaller updates as training approaches the end.
-
----
-
-# 13. Mixed Precision Training
+## 11. Mixed Precision Training
 
 Training uses automatic mixed precision:
 
@@ -472,662 +407,169 @@ with torch.amp.autocast('cuda'):
     loss = criterion(outputs, masks)
 ```
 
-and gradient scaling through:
+and gradient scaling:
 
 ```python
 torch.amp.GradScaler('cuda')
 ```
 
-The purpose is to reduce GPU memory usage and improve computational throughput while maintaining numerical stability through gradient scaling.
+Mixed precision allows suitable operations to use lower numerical precision while maintaining stability through gradient scaling.
+
+This can reduce memory usage and improve GPU throughput.
 
 ---
 
-# 14. Model Selection
+## 12. Encoder Experiment
 
-Two encoder configurations were trained independently:
-
-```python
-ENCODERS = [
-    "efficientnet-b1",
-    "resnet34"
-]
-```
-
-Each model has its own:
-
-- optimizer;
-- scheduler;
-- training history;
-- best checkpoint.
-
-A checkpoint is saved whenever validation Dice improves.
-
-Early stopping is triggered after 15 consecutive epochs without improvement.
-
-This prevents unnecessary training once the validation metric stops improving.
-
----
-
-# 15. Test-Time Augmentation
-
-Validation and inference use **Test-Time Augmentation (TTA)**.
-
-The original image is evaluated together with transformed versions:
+Two U-Net++ models were trained independently:
 
 ```text
-Original
-Horizontal flip
-Vertical flip
-Horizontal + vertical flip
-90° rotation
-270° rotation
+Model A → EfficientNet-B1 encoder
+Model B → ResNet-34 encoder
 ```
 
-The predictions are transformed back to the original coordinate system and averaged.
+Each model had:
 
-Mathematically, if \(P_i(x)\) is the probability map produced by augmentation \(i\), the TTA prediction is:
+- independent training;
+- independent optimizer state;
+- independent learning-rate schedule;
+- independent checkpoint;
+- independent validation history.
 
-\[
-P_{TTA}(x)
-=
-\frac{1}{6}
-\sum_{i=1}^{6}P_i(x)
-\]
-
-The final segmentation is:
-
-\[
-\hat{Y}(x)
-=
-\arg\max_c P_{TTA,c}(x)
-\]
-
-The motivation is that the object identity should remain unchanged under these transformations, while averaging predictions can reduce prediction variance.
+The purpose was to determine whether different encoder representations produce complementary segmentation predictions.
 
 ---
 
-# 16. Model Ensemble
+## 13. Test-Time Augmentation
 
-The two independently trained models are combined.
+Inference uses six transformations:
 
-For validation, the ensemble used:
+```text
+1. Original
+2. Horizontal flip
+3. Vertical flip
+4. Horizontal + vertical flip
+5. 90° rotation
+6. 270° rotation
+```
 
-\[
-P_{ensemble}
-=
-0.4P_{EfficientNet}
-+
-0.6P_{ResNet}
-\]
+Each transformed image is passed through the model.
 
-followed by:
-
-\[
-\hat{Y}
-=
-\arg\max_c P_{ensemble,c}
-\]
-
-This gives the ResNet-34 model slightly greater influence in the validation ensemble.
-
-For the final test inference, the two probability maps were averaged equally:
-
-\[
-P_{test}
-=
-\frac{P_{EfficientNet}+P_{ResNet}}{2}
-\]
-
-The ensemble idea is based on reducing correlated errors: if two models make different mistakes, averaging their probability distributions can produce a more robust prediction than either model alone.
-
----
-
-# 17. Small-Class Recovery Heuristic
-
-An additional inference rule was implemented for foreground classes that were completely absent from the initial `argmax` prediction.
-
-For each missing class:
-
-1. inspect the class probability map;
-2. select pixels with probability greater than `0.20`;
-3. if more than 150 pixels satisfy the threshold, retain the 150 highest-probability pixels;
-4. assign those pixels to the missing class.
+The transformed predictions are mapped back to the original coordinate system and averaged.
 
 Conceptually:
 
-\[
-\text{if predicted area}_c = 0
-\]
+```text
+             ┌── Original ─────────┐
+             ├── Horizontal Flip ──┤
+             ├── Vertical Flip ────┤
+Image ───────┼── HV Flip ──────────┼── Average
+             ├── 90° Rotation ─────┤
+             └── 270° Rotation ────┘
+                                      │
+                                      ▼
+                              Final probability map
+```
 
-then examine:
-
-\[
-P(y=c\mid x)>0.20
-\]
-
-and recover a small set of high-confidence candidate pixels.
-
-This was motivated by the fact that every foreground class is expected to occur in each image. The heuristic attempts to prevent a class from disappearing entirely due to the hard `argmax` decision.
-
-This is a deliberately task-specific post-processing step and should be evaluated carefully because forcing pixels into a missing class can also introduce false positives.
+Averaging multiple predictions can reduce sensitivity to a particular orientation or transformation.
 
 ---
 
-# 18. Observed Training Results
+## 14. Model Ensemble
 
-The recorded later-stage training behaviour was:
+The two trained models were combined at the probability level.
+
+For validation, the ensemble used:
+
+```text
+40% EfficientNet-B1
+60% ResNet-34
+```
+
+or:
+
+```python
+ensemble_probs = (
+    0.4 * probs_1 +
+    0.6 * probs_2
+)
+```
+
+For final test inference, equal weighting was used:
+
+```text
+50% EfficientNet-B1
+50% ResNet-34
+```
+
+The final class prediction is obtained with:
+
+```python
+preds = torch.argmax(ensemble_probs, dim=1)
+```
+
+The reasoning behind the ensemble is that independently trained models can make different errors. Combining their probability distributions can therefore produce a more stable prediction.
+
+---
+
+## 15. Missing-Class Recovery
+
+A task-specific post-processing step was also evaluated.
+
+If a foreground class was completely absent from the initial `argmax` prediction, its probability map was examined.
+
+Pixels satisfying:
+
+```text
+probability > 0.20
+```
+
+were considered candidates.
+
+If more than 150 candidate pixels existed, only the 150 highest-probability pixels were retained.
+
+The intuition was based on the known structure of the dataset: each image contains instances from all six foreground classes.
+
+This heuristic is intentionally conservative and is applied only when a class completely disappears from the initial prediction.
+
+---
+
+## 16. Training Results
+
+The recorded final portion of training was:
 
 | Epoch | Loss | Dice | Learning Rate |
 |---:|---:|---:|---:|
-| 89 | 0.0327 | 0.9795 | 3.0e-5 |
-| 90 | 0.0328 | 0.9795 | 2.4e-5 |
-| 91 | 0.0324 | 0.9795 | 2.0e-5 |
-| 92 | 0.0322 | 0.9795 | 1.6e-5 |
-| 93 | 0.0328 | 0.9795 | 1.2e-5 |
-| 94 | 0.0323 | 0.9795 | 9.0e-6 |
-| 95 | 0.0320 | 0.9795 | 6.0e-6 |
-| 96 | 0.0318 | **0.9796** | 4.0e-6 |
-| 97 | 0.0319 | 0.9795 | 2.0e-6 |
-| 98 | 0.0328 | 0.9795 | 1.0e-6 |
+| 89 | 0.0327 | 0.9795 | 0.000030 |
+| 90 | 0.0328 | 0.9795 | 0.000024 |
+| 91 | 0.0324 | 0.9795 | 0.000020 |
+| 92 | 0.0322 | 0.9795 | 0.000016 |
+| 93 | 0.0328 | 0.9795 | 0.000012 |
+| 94 | 0.0323 | 0.9795 | 0.000009 |
+| 95 | 0.0320 | 0.9795 | 0.000006 |
+| 96 | 0.0318 | **0.9796** | 0.000004 |
+| 97 | 0.0319 | 0.9795 | 0.000002 |
+| 98 | 0.0328 | 0.9795 | 0.000001 |
 | 99 | 0.0321 | **0.9796** | ~0 |
 | 100 | 0.0321 | **0.9796** | ~0 |
 
-### Convergence observation
+### Convergence
 
-From epoch 89 onward, the Dice score remained within:
+During these final epochs:
 
-\[
-0.9795 \leq Dice \leq 0.9796
-\]
+```text
+Dice ≈ 0.9795 – 0.9796
+Loss ≈ 0.032
+Learning rate → 0
+```
 
-while the learning rate decreased toward zero.
+The extremely small change in Dice indicates that the model had already reached a stable region of the optimization landscape.
 
-This indicates that the optimization had entered a highly stable region by the final stage.
-
-The improvement from:
-
-\[
-0.9795 \rightarrow 0.9796
-\]
-
-is extremely small, suggesting that the final epochs primarily performed fine adjustment rather than learning a substantially different representation.
+The final epochs therefore behaved more like fine-tuning than substantial representation learning.
 
 ---
 
-# 19. Results Interpretation
-
-The strongest value recorded in the training/validation log was:
-
-\[
-\boxed{Dice = 0.9796}
-\]
-
-with final recorded loss:
-
-\[
-\boxed{Loss = 0.0321}
-\]
-
-The important point is not only the absolute Dice value, but the behaviour of the optimization:
-
-```text
-High Dice
-   ↓
-Very small improvement
-   ↓
-Learning rate approaches zero
-   ↓
-Metric stabilizes
-```
-
-This suggests that the selected architecture and training configuration were able to learn a strong segmentation representation from the available labelled data.
-
-**The 0.9796 value should be interpreted as the recorded validation/training-loop Dice, not as an independently verified hidden-test score.**
-
----
-
-# 20. RLE Encoding
-
-The final masks are converted to **Run Length Encoding (RLE)**.
-
-A binary mask is first flattened using column-major ordering:
-
-```python
-px = np.asarray(mask, np.uint8).T.flatten()
-```
-
-The resulting sequence is converted into:
-
-```text
-start_position run_length
-```
-
-pairs.
-
-For example:
-
-```text
-2 2
-```
-
-represents:
-
-```text
-pixel 2
-pixel 3
-```
-
-The ordering matters because the evaluator reconstructs the 2D mask using Fortran-style ordering.
-
-The implementation also includes an RLE decoder so that the encoding process can be verified.
-
----
-
-# 21. Submission Generation
-
-For every test image and every foreground class:
-
-```python
-mask = predicted_label_map == class_id
-```
-
-The binary mask is converted to RLE and written to:
-
-```text
-ImageId_ClassId,EncodedPixels
-```
-
-The submission therefore contains:
-
-\[
-500\times6=3000
-\]
-
-prediction rows.
-
-The complete pipeline is:
-
-```text
-Test Image
-    ↓
-EfficientNet-B1
-    ↓
-TTA probability maps
-    │
-    ├──────────────┐
-    ↓              ↓
-ResNet-34       Ensemble
-    ↓              │
-    └──────────────┘
-           ↓
-     Pixel-wise argmax
-           ↓
-   Missing-class recovery
-           ↓
-     Class segmentation
-           ↓
-          RLE
-           ↓
-    submission.csv
-```
-
----
-
-# 22. Experimental Methodology
-
-The experiments were structured around controlled comparisons rather than changing every component simultaneously.
-
-The primary architectural experiment was:
-
-```text
-U-Net++ + EfficientNet-B1
-vs.
-U-Net++ + ResNet-34
-```
-
-After training the individual models, their probability outputs were combined through an ensemble.
-
-This provides three levels of comparison:
-
-```text
-Single model
-     ↓
-Single model + TTA
-     ↓
-Multi-model ensemble + TTA
-```
-
-This makes it possible to study whether improvements come from:
-
-- architecture;
-- prediction averaging;
-- geometric test-time augmentation;
-- ensemble diversity;
-- task-specific post-processing.
-
----
-
-# 23. Dataset and GitHub Policy
-
-The original training and test images are **not included in this GitHub repository**.
-
-This is intentional.
-
-The dataset is large, unnecessary for reproducing the source code itself, and was provided specifically for the associated competition/task. The repository therefore contains the **code, experiment configuration, methodology, and results**, while the dataset remains external.
-
-Recommended repository structure:
-
-```text
-.
-├── README.md
-├── requirements.txt
-├── .gitignore
-│
-├── notebooks/
-│   └── segmentation_experiment.ipynb
-│
-├── src/
-│   ├── dataset.py
-│   ├── model.py
-│   ├── losses.py
-│   ├── train.py
-│   ├── inference.py
-│   └── rle.py
-│
-├── checkpoints/
-│   └── best_models/
-│
-├── outputs/
-│   ├── predictions/
-│   └── submission.csv
-│
-└── experiments/
-    └── training_logs/
-```
-
-### Dataset setup
-
-After obtaining the dataset through the original source, configure its local path in the training script:
-
-```python
-DATASET_DIR = "/path/to/Dataset"
-```
-
-Expected layout:
-
-```text
-Dataset/
-├── train/
-│   ├── images/
-│   └── masks/
-│
-├── test/
-│   └── images/
-│
-├── train.csv
-├── metadata.csv
-└── sample_submission.csv
-```
-
-Do **not** commit the raw dataset, generated masks, or large model checkpoints unless there is a specific reason to distribute them and you have permission to do so.
-
-A `.gitignore` should therefore include entries such as:
-
-```gitignore
-# Dataset
-Dataset/
-data/
-train/
-test/
-
-# Model checkpoints
-*.pth
-*.pt
-*.ckpt
-
-# Generated outputs
-outputs/
-submission.csv
-
-# Python
-__pycache__/
-*.py[cod]
-.ipynb_checkpoints/
-```
-
-The repository remains useful without the data because the objective is to document and reproduce the **methodology and implementation**. Anyone with legitimate access to the dataset can point `DATASET_DIR` to their local copy.
-
----
-
-# 23. Project Structure
-
-A clean repository layout is:
-
-```text
-.
-├── README.md
-├── requirements.txt
-│
-├── notebooks/
-│   └── segmentation_experiment.ipynb
-│
-├── src/
-│   ├── dataset.py
-│   ├── model.py
-│   ├── losses.py
-│   ├── train.py
-│   ├── inference.py
-│   └── rle.py
-│
-├── checkpoints/
-│   ├── best_unet_resnet34.pth
-│   └── best_unet_efficientnet-b1.pth
-│
-├── outputs/
-│   ├── predictions/
-│   └── submission.csv
-│
-└── experiments/
-    └── training_logs/
-```
-
-The original dataset should generally remain outside the Git repository because of its size.
-
----
-
-# 24. Reproducibility
-
-The experiments use:
-
-```python
-SEED = 42
-```
-
-and explicitly seed:
-
-```text
-Python random
-NumPy
-PyTorch
-CUDA
-```
-
-when CUDA is available.
-
-The models are initialized from scratch:
-
-```python
-encoder_weights=None
-```
-
-followed by Kaiming initialization of convolutional and linear layers.
-
-No external training dataset is required by the implementation.
-
----
-
-# 25. Engineering Lessons
-
-This project demonstrates that segmentation performance depends on much more than the network architecture.
-
-Several parts of the pipeline are equally important:
-
-### Correct mask loading
-
-The mask contains class IDs, not RGB semantic information.
-
-### Correct spatial transformations
-
-Image and mask transformations must remain geometrically synchronized.
-
-### Correct loss
-
-The objective should reflect the segmentation problem rather than relying only on generic classification loss.
-
-### Correct validation
-
-Model selection should use a fixed validation split and the same metric used for the actual task.
-
-### Correct inference
-
-TTA and ensembling operate on probability maps before the final `argmax`.
-
-### Correct RLE
-
-A mathematically correct segmentation can still produce an incorrect submission if the flattening order is wrong.
-
----
-
-# 26. Future Experiments
-
-The current pipeline provides several natural directions for further experimentation.
-
-## Architecture
-
-Compare:
-
-- U-Net
-- U-Net++
-- DeepLab
-- different U-Net++ encoder sizes
-
-## Loss functions
-
-Evaluate:
-
-\[
-\mathcal{L}
-=
-\lambda_1\mathcal{L}_{Dice}
-+
-\lambda_2\mathcal{L}_{CE}
-\]
-
-for different values of \(\lambda_1,\lambda_2\).
-
-The current experiment uses:
-
-\[
-\lambda_1=\lambda_2=0.5
-\]
-
-## Augmentation
-
-Perform controlled ablations of:
-
-- geometric augmentation;
-- colour augmentation;
-- blur/noise;
-- coarse dropout.
-
-## TTA
-
-Compare:
-
-```text
-No TTA
-6-way TTA
-Different transformation subsets
-```
-
-## Ensemble weights
-
-Instead of fixed weights:
-
-\[
-0.4/0.6
-\]
-
-evaluate different combinations on the same validation split.
-
-## Post-processing
-
-The missing-class recovery heuristic can be studied independently to determine whether it improves Dice or simply increases false-positive regions.
-
----
-
-# 27. Key Takeaways
-
-### Task
-
-Multi-class semantic segmentation of six mechanical-part categories.
-
-### Data
-
-\[
-2000\ \text{training images}
-\]
-
-\[
-500\ \text{test images}
-\]
-
-\[
-384\times384\ \text{RGB}
-\]
-
-### Architecture
-
-\[
-\boxed{\text{U-Net++}}
-\]
-
-with:
-
-```text
-ResNet-34
-EfficientNet-B1
-```
-
-encoder experiments.
-
-### Loss
-
-\[
-\boxed{
-0.5\,DiceLoss + 0.5\,CrossEntropyLoss
-}
-\]
-
-### Optimization
-
-```text
-AdamW
-+ Cosine Annealing
-+ Mixed Precision
-```
-
-### Inference
-
-```text
-TTA
-+
-Model Ensemble
-+
-Missing-class recovery
-```
-
-### Official leaderboard result
+# 17. Final Leaderboard Result
 
 The final submitted solution achieved:
 
@@ -1136,38 +578,347 @@ The final submitted solution achieved:
 | **Private leaderboard Dice** | **0.97960** |
 | Public leaderboard Dice | 0.98096 |
 
-The **private score is the final score** and is therefore the primary result reported for this project.
+The **private score of 0.97960 is the primary final result** because it is the score used for the final evaluation.
 
-### Main lesson
-
-A strong segmentation system is a complete pipeline:
-
-\[
-\boxed{
-\text{Data}
-\rightarrow
-\text{Augmentation}
-\rightarrow
-\text{Architecture}
-\rightarrow
-\text{Loss}
-\rightarrow
-\text{Optimization}
-\rightarrow
-\text{TTA}
-\rightarrow
-\text{Ensemble}
-\rightarrow
-\text{Post-processing}
-\rightarrow
-\text{RLE}
-}
-\]
+The recorded validation/training-loop Dice of approximately 0.9796 was also consistent with the final private result.
 
 ---
 
-## Author's Note
+## 18. RLE Submission
 
-This project was developed as an end-to-end study of dense prediction using modern deep learning techniques.
+The segmentation masks must be converted into **Run Length Encoding (RLE)** before submission.
 
-The emphasis is on understanding **why each component is used**, measuring its effect, and maintaining a reproducible experimental pipeline rather than treating the segmentation model as a black box.
+The encoder converts a binary mask into:
+
+```text
+start_position run_length
+```
+
+pairs.
+
+The important detail is that the competition uses **column-major / Fortran ordering**.
+
+For a 4 × 4 mask, pixels are numbered:
+
+```text
+1   5   9   13
+2   6   10  14
+3   7   11  15
+4   8   12  16
+```
+
+Therefore, a normal row-major flattening would produce an incorrect submission.
+
+The implementation explicitly handles this ordering and also provides an RLE decoder for verification.
+
+---
+
+## 19. Inference Pipeline
+
+The final inference process is:
+
+```text
+                 Test Image
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+          ▼                     ▼
+   EfficientNet-B1          ResNet-34
+          │                     │
+          ▼                     ▼
+         TTA                   TTA
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+               Probability
+                 Ensemble
+                     │
+                     ▼
+             Pixel-wise Argmax
+                     │
+                     ▼
+          Missing-class recovery
+                     │
+                     ▼
+             Final segmentation
+                     │
+                     ▼
+                    RLE
+                     │
+                     ▼
+              submission.csv
+```
+
+---
+
+## 20. Reproducibility
+
+A fixed seed is used:
+
+```python
+SEED = 42
+```
+
+The seed is applied to:
+
+- Python random;
+- NumPy;
+- PyTorch;
+- CUDA when available.
+
+The models are initialized without pretrained weights:
+
+```python
+encoder_weights=None
+```
+
+and convolutional/linear layers use Kaiming initialization.
+
+The notebook contains the complete experimental workflow, from loading the data through training, validation, inference, and submission generation.
+
+---
+
+## 21. Important Implementation Details
+
+### Mask loading
+
+Correct:
+
+```python
+mask = np.array(Image.open(mask_path))
+```
+
+Incorrect:
+
+```python
+mask = Image.open(mask_path).convert("RGB")
+```
+
+The latter converts class IDs into palette colours.
+
+### Image and mask augmentation
+
+Geometric transformations are applied jointly to the image and mask so that pixel correspondence is preserved.
+
+### Validation
+
+The validation split is fixed using the random seed so that different experiments can be compared under the same conditions.
+
+### Submission keys
+
+The submission is generated for every:
+
+```text
+image × foreground class
+```
+
+pair, producing:
+
+```text
+500 × 6 = 3,000 rows
+```
+
+---
+
+# 22. Repository
+
+The repository intentionally contains only the two main project artifacts:
+
+```text
+.
+├── README.md
+└── segmentation_experiment.ipynb
+```
+
+### `README.md`
+
+Documents:
+
+- problem formulation;
+- architecture;
+- training methodology;
+- experiments;
+- inference strategy;
+- results;
+- implementation decisions.
+
+### `segmentation_experiment.ipynb`
+
+Contains the actual implementation and experimental workflow.
+
+The raw training/test dataset is not included in the repository.
+
+This keeps the repository lightweight while allowing anyone with legitimate access to the dataset to reproduce the experiments by changing the dataset path in the notebook.
+
+---
+
+# 23. Experimental Philosophy
+
+The project was developed as a sequence of measurable experiments rather than treating the final model as a black box.
+
+The general workflow was:
+
+```text
+Define problem
+      ↓
+Prepare masks and augmentations
+      ↓
+Train segmentation model
+      ↓
+Evaluate on validation split
+      ↓
+Compare encoder architectures
+      ↓
+Apply TTA
+      ↓
+Evaluate ensemble
+      ↓
+Generate test predictions
+      ↓
+Convert masks to RLE
+      ↓
+Submit
+```
+
+This makes it possible to understand where improvements come from rather than changing multiple components without being able to isolate their effects.
+
+---
+
+# 24. Future Experiments
+
+Several controlled experiments could extend this work.
+
+### Architecture
+
+Compare:
+
+```text
+U-Net
+U-Net++
+DeepLab
+Different U-Net++ encoders
+```
+
+### Loss functions
+
+Experiment with different combinations of:
+
+```text
+Dice Loss
+Cross Entropy
+Focal Loss
+```
+
+For example:
+
+```text
+Loss = λ × Dice Loss + (1 - λ) × Cross Entropy
+```
+
+### Augmentation
+
+Perform ablations to determine the contribution of:
+
+```text
+Geometric augmentation
+Colour augmentation
+Noise / blur
+Coarse dropout
+```
+
+### TTA
+
+Compare:
+
+```text
+No TTA
+Flip-only TTA
+Rotation TTA
+Full TTA
+```
+
+### Ensemble weighting
+
+Evaluate different model weights on the same validation set:
+
+```text
+50 / 50
+40 / 60
+60 / 40
+```
+
+### Post-processing
+
+The missing-class recovery heuristic can be evaluated independently to determine whether it improves Dice or introduces unnecessary false-positive pixels.
+
+---
+
+# 25. Summary
+
+This project developed a complete semantic segmentation system for mechanical components using U-Net++ and two different encoders.
+
+### Dataset
+
+```text
+2,000 training images
+500 test images
+384 × 384 RGB
+6 foreground classes
+```
+
+### Architecture
+
+```text
+U-Net++
+├── ResNet-34
+└── EfficientNet-B1
+```
+
+### Training
+
+```text
+AdamW
++ Dice + Cross Entropy
++ Cosine Annealing
++ Mixed Precision
++ Data Augmentation
+```
+
+### Inference
+
+```text
+TTA
++ Model Ensemble
++ Missing-Class Recovery
+```
+
+### Final result
+
+```text
+Private Dice: 0.97960
+Public Dice:  0.98096
+```
+
+The main takeaway is that strong segmentation performance comes from the interaction of the entire pipeline:
+
+```text
+Data
+  ↓
+Augmentation
+  ↓
+Architecture
+  ↓
+Loss
+  ↓
+Optimization
+  ↓
+TTA
+  ↓
+Ensemble
+  ↓
+Post-processing
+  ↓
+RLE
+```
+
+rather than from the architecture alone.
